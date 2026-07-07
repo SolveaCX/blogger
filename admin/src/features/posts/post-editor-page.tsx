@@ -4,7 +4,7 @@ import { Globe2, Languages, Loader2, Save, Upload } from "lucide-react"
 import { useEffect, useMemo, useState } from "react"
 import { Controller, useForm, useWatch } from "react-hook-form"
 import { useTranslation } from "react-i18next"
-import { Link, useNavigate, useParams } from "react-router-dom"
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom"
 import { toast } from "sonner"
 import { z } from "zod"
 import { useMutation, useQueryClient } from "@tanstack/react-query"
@@ -56,6 +56,12 @@ const postSchema = z.object({
 
 type PostFormValues = z.infer<typeof postSchema>
 
+type TranslationSelectionState = {
+  key: string
+  languages: string[]
+  overwriteExisting: boolean
+}
+
 export function PostEditorPage({
   token,
   site,
@@ -68,11 +74,11 @@ export function PostEditorPage({
   const { t } = useTranslation()
   const { theme } = useTheme()
   const { postId } = useParams()
+  const location = useLocation()
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [translationDialogOpen, setTranslationDialogOpen] = useState(false)
-  const [selectedTranslationLanguages, setSelectedTranslationLanguages] = useState<string[]>([])
-  const [overwriteExistingTranslations, setOverwriteExistingTranslations] = useState(false)
+  const [translationSelection, setTranslationSelection] = useState<TranslationSelectionState | null>(null)
   const postQuery = usePost(token, site?.id ?? null, postId ?? null)
   const editing = postQuery.data ?? null
   const defaultLanguage = firstSiteLanguage(site)
@@ -87,17 +93,22 @@ export function PostEditorPage({
     () => (site?.languages ?? []).filter((language) => language.key !== editing?.language),
     [editing?.language, site?.languages]
   )
+  const defaultTranslationLanguages = useMemo(
+    () => translationLanguageOptions.map((language) => language.key),
+    [translationLanguageOptions]
+  )
+  const translationSelectionKey = `${editing?.id ?? ""}:${defaultTranslationLanguages.join(",")}`
+  const activeTranslationSelection =
+    translationSelection?.key === translationSelectionKey ? translationSelection : null
+  const selectedTranslationLanguages = activeTranslationSelection?.languages ?? defaultTranslationLanguages
+  const overwriteExistingTranslations = activeTranslationSelection?.overwriteExisting ?? false
   const canGenerateTranslations =
     Boolean(editing) && selectedTranslationLanguages.length > 0 && translationLanguageOptions.length > 0
+  const postsHref = getPostsHref(location.state)
 
   useEffect(() => {
     form.reset(editing ? formFromPost(editing) : emptyPostForm(defaultLanguage))
   }, [defaultLanguage, editing, form])
-
-  useEffect(() => {
-    setSelectedTranslationLanguages(translationLanguageOptions.map((language) => language.key))
-    setOverwriteExistingTranslations(false)
-  }, [editing?.id, translationLanguageOptions])
 
   const saveMutation = useMutation({
     mutationFn: (values: PostFormValues) => {
@@ -112,7 +123,7 @@ export function PostEditorPage({
       await queryClient.invalidateQueries({ queryKey: ["posts", token, site?.id ?? null] })
       await queryClient.invalidateQueries({ queryKey: ["post", token, site?.id ?? null, saved.id] })
       if (!postId) {
-        navigate(`/posts/${saved.id}/edit`, { replace: true })
+        navigate(`/posts/${saved.id}/edit`, { replace: true, state: location.state })
       }
     },
     onError: (error) => toast.error(error instanceof Error ? error.message : String(error)),
@@ -152,9 +163,36 @@ export function PostEditorPage({
   }
 
   function toggleTranslationLanguage(language: string) {
-    setSelectedTranslationLanguages((current) =>
-      current.includes(language) ? current.filter((value) => value !== language) : [...current, language]
-    )
+    setTranslationSelection((current) => {
+      const selection =
+        current?.key === translationSelectionKey
+          ? current
+          : {
+              key: translationSelectionKey,
+              languages: defaultTranslationLanguages,
+              overwriteExisting: false,
+            }
+      const languages = selection.languages.includes(language)
+        ? selection.languages.filter((value) => value !== language)
+        : [...selection.languages, language]
+
+      return { ...selection, languages }
+    })
+  }
+
+  function setOverwriteTranslations(value: boolean) {
+    setTranslationSelection((current) => {
+      const selection =
+        current?.key === translationSelectionKey
+          ? current
+          : {
+              key: translationSelectionKey,
+              languages: defaultTranslationLanguages,
+              overwriteExisting: false,
+            }
+
+      return { ...selection, overwriteExisting: value }
+    })
   }
 
   if (!site) {
@@ -175,7 +213,7 @@ export function PostEditorPage({
           </div>
           <CardAction className="flex gap-2">
             <Button type="button" variant="outline" asChild>
-              <Link to="/posts">{t("common.cancel")}</Link>
+              <Link to={postsHref}>{t("common.cancel")}</Link>
             </Button>
             {editing ? (
               <Button
@@ -347,7 +385,7 @@ export function PostEditorPage({
                   type="checkbox"
                   className="size-4"
                   checked={overwriteExistingTranslations}
-                  onChange={(event) => setOverwriteExistingTranslations(event.target.checked)}
+                  onChange={(event) => setOverwriteTranslations(event.target.checked)}
                 />
                 <span>{t("posts.overwriteDraftTranslations")}</span>
               </label>
@@ -387,6 +425,24 @@ function formFromPost(post: Post): PostFormValues {
     metaDescription: post.meta_description || "",
     canonicalUrl: post.canonical_url || "",
   }
+}
+
+function getPostsHref(state: unknown) {
+  if (!isPostsListState(state)) {
+    return "/posts"
+  }
+
+  return `/posts${state.postsListSearch}`
+}
+
+function isPostsListState(state: unknown): state is { postsListSearch: string } {
+  return (
+    typeof state === "object" &&
+    state !== null &&
+    "postsListSearch" in state &&
+    typeof state.postsListSearch === "string" &&
+    (state.postsListSearch === "" || state.postsListSearch.startsWith("?"))
+  )
 }
 
 function emptyPostForm(language: string): PostFormValues {

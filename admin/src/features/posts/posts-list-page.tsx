@@ -1,6 +1,6 @@
 import { Edit, Globe2, Plus, Search, Trash2 } from "lucide-react"
-import { useMemo, useState } from "react"
-import { Link } from "react-router-dom"
+import { useCallback, useEffect, useMemo } from "react"
+import { Link, useLocation, useSearchParams } from "react-router-dom"
 import { useTranslation } from "react-i18next"
 import { toast } from "sonner"
 import { useMutation, useQueryClient } from "@tanstack/react-query"
@@ -36,6 +36,14 @@ import type { Category, Post, PostStatus, Site } from "@/types"
 const PAGE_SIZE = 10
 const ALL_VALUE = "__all__"
 
+type PostsListSearchUpdates = {
+  q?: string
+  language?: string
+  categoryId?: string
+  status?: PostStatus | ""
+  page?: number
+}
+
 export function PostsListPage({
   token,
   site,
@@ -47,13 +55,41 @@ export function PostsListPage({
 }) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
-  const [query, setQuery] = useState("")
-  const [language, setLanguage] = useState("")
-  const [categoryId, setCategoryId] = useState("")
-  const [status, setStatus] = useState<PostStatus | "">("")
-  const [page, setPage] = useState(0)
+  const location = useLocation()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const query = searchParams.get("q") ?? ""
+  const language = searchParams.get("language") ?? ""
+  const categoryId = searchParams.get("category_id") ?? ""
+  const status = parsePostStatus(searchParams.get("status"))
+  const page = parsePageParam(searchParams.get("page"))
+  const postsListState = useMemo(() => ({ postsListSearch: location.search }), [location.search])
   const languageOptions = useMemo(() => siteLanguageOptions(site), [site])
   const effectiveLanguage = languageOptions.some((option) => option.value === language) ? language : ""
+  const updateListSearch = useCallback(
+    (updates: PostsListSearchUpdates, options?: { replace?: boolean }) => {
+      setSearchParams(
+        (current) => {
+          const next = new URLSearchParams(current)
+          setSearchValue(next, "q", updates.q)
+          setSearchValue(next, "language", updates.language)
+          setSearchValue(next, "category_id", updates.categoryId)
+          setSearchValue(next, "status", updates.status)
+
+          if (updates.page !== undefined) {
+            if (updates.page > 0) {
+              next.set("page", String(updates.page + 1))
+            } else {
+              next.delete("page")
+            }
+          }
+
+          return next
+        },
+        options
+      )
+    },
+    [setSearchParams]
+  )
 
   const params = useMemo(
     () => ({
@@ -76,6 +112,14 @@ export function PostsListPage({
   const canGoPrevious = page > 0
   const canGoNext = (page + 1) * PAGE_SIZE < total
 
+  useEffect(() => {
+    if (postsQuery.isFetching || total === 0 || page < pageCount) {
+      return
+    }
+
+    updateListSearch({ page: pageCount - 1 }, { replace: true })
+  }, [page, pageCount, postsQuery.isFetching, total, updateListSearch])
+
   const statusMutation = useMutation({
     mutationFn: ({ post, action }: { post: Post; action: "publish" | "unpublish" }) =>
       action === "publish"
@@ -97,11 +141,6 @@ export function PostsListPage({
     onError: (error) => toast.error(error instanceof Error ? error.message : String(error)),
   })
 
-  function resetPage(next: () => void) {
-    setPage(0)
-    next()
-  }
-
   function deletePost(post: Post) {
     if (window.confirm(t("posts.confirmDelete", { title: post.title }))) {
       deleteMutation.mutate(post)
@@ -117,7 +156,7 @@ export function PostsListPage({
       <CardHeader className="gap-3 md:flex-row md:items-center md:justify-between">
         <CardTitle>{t("nav.posts")}</CardTitle>
         <Button asChild>
-          <Link to="/posts/new">
+          <Link to="/posts/new" state={postsListState}>
             <Plus />
             {t("posts.new")}
           </Link>
@@ -131,22 +170,28 @@ export function PostsListPage({
               className="pl-8"
               placeholder={t("posts.search")}
               value={query}
-              onChange={(event) => resetPage(() => setQuery(event.target.value))}
+              onChange={(event) => updateListSearch({ q: event.target.value, page: 0 }, { replace: true })}
             />
           </div>
           <SimpleSelect
             value={effectiveLanguage || ALL_VALUE}
-            onValueChange={(value) => resetPage(() => setLanguage(value === ALL_VALUE ? "" : value))}
+            onValueChange={(value) =>
+              updateListSearch({ language: value === ALL_VALUE ? "" : value, page: 0 }, { replace: true })
+            }
             options={[{ value: ALL_VALUE, label: t("common.allLanguages") }, ...languageOptions]}
           />
           <SimpleSelect
             value={categoryId || ALL_VALUE}
-            onValueChange={(value) => resetPage(() => setCategoryId(value === ALL_VALUE ? "" : value))}
+            onValueChange={(value) =>
+              updateListSearch({ categoryId: value === ALL_VALUE ? "" : value, page: 0 }, { replace: true })
+            }
             options={[{ value: ALL_VALUE, label: t("common.allCategories") }, ...categories.map((category) => ({ value: category.id, label: category.name }))]}
           />
           <SimpleSelect
             value={status || ALL_VALUE}
-            onValueChange={(value) => resetPage(() => setStatus(value === ALL_VALUE ? "" : (value as PostStatus)))}
+            onValueChange={(value) =>
+              updateListSearch({ status: value === ALL_VALUE ? "" : (value as PostStatus), page: 0 }, { replace: true })
+            }
             options={[
               { value: ALL_VALUE, label: t("common.allStatuses") },
               { value: "draft", label: t("common.draft") },
@@ -198,7 +243,7 @@ export function PostsListPage({
                   <TableCell>
                     <div className="flex justify-end gap-1">
                       <Button variant="outline" size="sm" asChild>
-                        <Link to={`/posts/${post.id}/edit`}>
+                        <Link to={`/posts/${post.id}/edit`} state={postsListState}>
                           <Edit />
                           {t("common.edit")}
                         </Link>
@@ -241,7 +286,7 @@ export function PostsListPage({
                   onClick={(event) => {
                     event.preventDefault()
                     if (canGoPrevious) {
-                      setPage((value) => Math.max(0, value - 1))
+                      updateListSearch({ page: Math.max(0, page - 1) })
                     }
                   }}
                 />
@@ -260,7 +305,7 @@ export function PostsListPage({
                   onClick={(event) => {
                     event.preventDefault()
                     if (canGoNext) {
-                      setPage((value) => value + 1)
+                      updateListSearch({ page: page + 1 })
                     }
                   }}
                 />
@@ -271,4 +316,25 @@ export function PostsListPage({
       </CardContent>
     </Card>
   )
+}
+
+function parsePageParam(value: string | null) {
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed - 1 : 0
+}
+
+function parsePostStatus(value: string | null): PostStatus | "" {
+  return value === "draft" || value === "published" ? value : ""
+}
+
+function setSearchValue(searchParams: URLSearchParams, key: string, value: string | undefined) {
+  if (value === undefined) {
+    return
+  }
+
+  if (value) {
+    searchParams.set(key, value)
+  } else {
+    searchParams.delete(key)
+  }
 }
