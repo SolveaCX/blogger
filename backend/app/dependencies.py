@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, Header, HTTPException, Request, status
 from sqlalchemy import select
@@ -15,6 +15,17 @@ class Principal:
     user: models.User
     auth_type: str
     access_key: models.AccessKey | None = None
+
+
+ACCESS_KEY_USAGE_UPDATE_INTERVAL = timedelta(minutes=5)
+
+
+def should_update_access_key_usage(last_used_at: datetime | None, now: datetime) -> bool:
+    if last_used_at is None:
+        return True
+    if last_used_at.tzinfo is None:
+        last_used_at = last_used_at.replace(tzinfo=timezone.utc)
+    return now - last_used_at >= ACCESS_KEY_USAGE_UPDATE_INTERVAL
 
 
 def _bearer_token(request: Request) -> str | None:
@@ -48,9 +59,11 @@ def get_current_principal(
         user = db.get(models.User, access_key.user_id)
         if not user or not user.is_active:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Inactive user")
-        access_key.last_used_at = datetime.now(timezone.utc)
-        db.add(access_key)
-        db.commit()
+        now = datetime.now(timezone.utc)
+        if should_update_access_key_usage(access_key.last_used_at, now):
+            access_key.last_used_at = now
+            db.add(access_key)
+            db.commit()
         return Principal(user=user, auth_type="access_key", access_key=access_key)
 
     if token:
