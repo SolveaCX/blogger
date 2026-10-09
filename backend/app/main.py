@@ -37,10 +37,10 @@ def create_tables() -> None:
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, str]:
+async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.get("/api/healthz")
-def api_healthz() -> dict[str, str]:
+async def api_healthz() -> dict[str, str]:
     return {"status": "ok"}

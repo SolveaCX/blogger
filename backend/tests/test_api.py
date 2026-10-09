@@ -1,4 +1,5 @@
 import base64
+import inspect
 import os
 from pathlib import Path
 
@@ -13,7 +14,7 @@ os.environ["ACCESS_KEY_PEPPER"] = "test-pepper"
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.db import Base, engine  # noqa: E402
-from app.main import app  # noqa: E402
+from app.main import api_healthz, app, healthz  # noqa: E402
 from app.translation_service import TranslationResult  # noqa: E402
 
 Base.metadata.drop_all(bind=engine)
@@ -24,6 +25,11 @@ PNG_1X1 = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
     "AAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
 )
+
+
+def test_health_handlers_do_not_depend_on_the_sync_thread_pool() -> None:
+    assert inspect.iscoroutinefunction(healthz)
+    assert inspect.iscoroutinefunction(api_healthz)
 
 
 def reset_db() -> None:
