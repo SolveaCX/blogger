@@ -13,6 +13,9 @@ TAG="${TAG:-$(date +%Y%m%d%H%M%S)}"
 DATABASE_URL_SECRET="${DATABASE_URL_SECRET:-blogger-database-url}"
 SECRET_KEY_SECRET="${SECRET_KEY_SECRET:-blogger-secret-key}"
 ACCESS_KEY_PEPPER_SECRET="${ACCESS_KEY_PEPPER_SECRET:-blogger-access-key-pepper}"
+TRANSLATION_API_KEY_SECRET="${TRANSLATION_API_KEY_SECRET:-blogger-translation-api-key}"
+TRANSLATION_API_BASE_URL="${TRANSLATION_API_BASE_URL:-https://router.flatkey.ai}"
+TRANSLATION_MODEL="${TRANSLATION_MODEL:-gpt-5.6-terra}"
 
 if [[ -z "${PROJECT_ID}" ]]; then
   echo "PROJECT_ID is required" >&2
@@ -70,8 +73,8 @@ gcloud run deploy "${API_SERVICE}" \
   --region "${REGION}" \
   --allow-unauthenticated \
   --add-cloudsql-instances "${CONNECTION_NAME}" \
-  --set-secrets "DATABASE_URL=${DATABASE_URL_SECRET}:latest,SECRET_KEY=${SECRET_KEY_SECRET}:latest,ACCESS_KEY_PEPPER=${ACCESS_KEY_PEPPER_SECRET}:latest" \
-  --set-env-vars "^|^AUTO_CREATE_TABLES=true|ALLOWED_ORIGINS=http://localhost:5173,http://localhost:5174|GCS_BUCKET=${ASSET_BUCKET}" \
+  --set-secrets "DATABASE_URL=${DATABASE_URL_SECRET}:latest,SECRET_KEY=${SECRET_KEY_SECRET}:latest,ACCESS_KEY_PEPPER=${ACCESS_KEY_PEPPER_SECRET}:latest,TRANSLATION_API_KEY=${TRANSLATION_API_KEY_SECRET}:latest" \
+  --set-env-vars "^|^AUTO_CREATE_TABLES=true|ALLOWED_ORIGINS=http://localhost:5173,http://localhost:5174|GCS_BUCKET=${ASSET_BUCKET}|TRANSLATION_API_BASE_URL=${TRANSLATION_API_BASE_URL}|TRANSLATION_MODEL=${TRANSLATION_MODEL}" \
   --port 8080
 
 API_URL="$(run_url "${API_SERVICE}")"
