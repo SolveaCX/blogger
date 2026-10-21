@@ -218,7 +218,11 @@ def _request_translation_json(
             response = client.post(_endpoint(settings.translation_api_base_url), headers=headers, json=payload)
             response.raise_for_status()
     except httpx.HTTPError as exc:
-        raise TranslationUnavailableError(f"Translation request failed: {exc}") from exc
+        detail = ""
+        if isinstance(exc, httpx.HTTPStatusError):
+            detail = exc.response.text.strip()
+        suffix = f"; provider_response={detail[:1000]}" if detail else ""
+        raise TranslationUnavailableError(f"Translation request failed: {exc}{suffix}") from exc
 
     try:
         body = response.json()
