@@ -28,6 +28,7 @@ class Settings:
     translation_api_base_url: str | None = os.getenv("TRANSLATION_API_BASE_URL") or None
     translation_api_key: str | None = os.getenv("TRANSLATION_API_KEY") or None
     translation_model: str | None = os.getenv("TRANSLATION_MODEL") or None
+    translation_api_mode: str = os.getenv("TRANSLATION_API_MODE", "chat_completions")
     translation_timeout_seconds: float = float(os.getenv("TRANSLATION_TIMEOUT_SECONDS", "60"))
 
     def __post_init__(self) -> None:

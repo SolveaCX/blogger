@@ -123,6 +123,15 @@ def _endpoint(base_url: str) -> str:
     return f"{normalized}/v1/chat/completions"
 
 
+def _responses_endpoint(base_url: str) -> str:
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/responses"):
+        return normalized
+    if normalized.endswith("/v1"):
+        return f"{normalized}/responses"
+    return f"{normalized}/v1/responses"
+
+
 def _message_text(content: object) -> str:
     if isinstance(content, str):
         return content
@@ -133,6 +142,23 @@ def _message_text(content: object) -> str:
                 parts.append(item["text"])
         return "".join(parts)
     return ""
+
+
+def _response_output_text(body: dict[str, object]) -> str:
+    output = body.get("output")
+    if not isinstance(output, list):
+        return ""
+    parts: list[str] = []
+    for item in output:
+        if not isinstance(item, dict):
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "output_text" and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+    return "".join(parts)
 
 
 def _load_json_object(raw: str) -> dict[str, object]:
@@ -195,18 +221,29 @@ def _request_translation_json(
     if not settings.translation_api_base_url or not settings.translation_api_key or not settings.translation_model:
         raise TranslationUnavailableError("Translation API is not configured")
 
-    payload = {
-        "model": settings.translation_model,
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": json.dumps(user_payload, ensure_ascii=False),
-            },
-        ],
-    }
+    api_mode = getattr(settings, "translation_api_mode", "chat_completions")
+    if api_mode == "responses":
+        endpoint = _responses_endpoint(settings.translation_api_base_url)
+        payload = {
+            "model": settings.translation_model,
+            "instructions": system_prompt,
+            "input": json.dumps(user_payload, ensure_ascii=False),
+            "text": {"format": {"type": "json_object"}},
+        }
+    else:
+        endpoint = _endpoint(settings.translation_api_base_url)
+        payload = {
+            "model": settings.translation_model,
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": json.dumps(user_payload, ensure_ascii=False),
+                },
+            ],
+        }
 
     headers = {
         "Authorization": f"Bearer {settings.translation_api_key}",
@@ -215,7 +252,7 @@ def _request_translation_json(
 
     try:
         with httpx.Client(timeout=settings.translation_timeout_seconds) as client:
-            response = client.post(_endpoint(settings.translation_api_base_url), headers=headers, json=payload)
+            response = client.post(endpoint, headers=headers, json=payload)
             response.raise_for_status()
     except httpx.HTTPError as exc:
         detail = ""
@@ -228,6 +265,9 @@ def _request_translation_json(
         body = response.json()
     except json.JSONDecodeError as exc:
         raise TranslationUnavailableError("Translation provider returned invalid JSON") from exc
+
+    if api_mode == "responses":
+        return _load_json_object(_response_output_text(body))
 
     choices = body.get("choices")
     if not isinstance(choices, list) or not choices:
