@@ -227,7 +227,7 @@ def _request_translation_json(
         payload = {
             "model": settings.translation_model,
             "instructions": system_prompt,
-            "input": json.dumps(user_payload, ensure_ascii=False),
+            "input": f"Return a json object only.\n{json.dumps(user_payload, ensure_ascii=False)}",
             "text": {"format": {"type": "json_object"}},
         }
     else:
