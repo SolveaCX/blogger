@@ -104,6 +104,6 @@ def test_translation_supports_responses_api(monkeypatch):
     assert _ResponsesClient.request_json == {
         "model": "test-model",
         "instructions": "translate",
-        "input": '{"text": "hello"}',
+        "input": 'Return a json object only.\n{"text": "hello"}',
         "text": {"format": {"type": "json_object"}},
     }
