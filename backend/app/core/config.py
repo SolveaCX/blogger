@@ -23,6 +23,7 @@ class Settings:
     allowed_origins: list[str] = None  # type: ignore[assignment]
     auto_create_tables: bool = os.getenv("AUTO_CREATE_TABLES", "true").lower() == "true"
     gcs_bucket: str | None = os.getenv("GCS_BUCKET") or None
+    local_asset_dir: str | None = os.getenv("LOCAL_ASSET_DIR") or None
     public_asset_base_url: str | None = os.getenv("PUBLIC_ASSET_BASE_URL") or None
     upload_prefix: str = os.getenv("UPLOAD_PREFIX", "uploads")
     translation_api_base_url: str | None = os.getenv("TRANSLATION_API_BASE_URL") or None
