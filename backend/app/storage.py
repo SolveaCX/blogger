@@ -83,6 +83,17 @@ def store_upload(file: UploadFile, kind: str, user_id: str) -> StoredFile:
     safe_kind = _safe_kind(kind)
     name = f"{settings.upload_prefix}/{safe_kind}/{user_id}/{uuid4().hex}{_extension(file.filename or '', content_type)}"
 
+    if settings.local_asset_dir:
+        if not settings.public_asset_base_url:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="PUBLIC_ASSET_BASE_URL is required for local asset storage",
+            )
+        path = Path(settings.local_asset_dir) / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+        return StoredFile(url=f"{settings.public_asset_base_url.rstrip('/')}/{name}")
+
     if not settings.gcs_bucket:
         encoded = base64.b64encode(data).decode("ascii")
         return StoredFile(url=f"data:{content_type};base64,{encoded}")
