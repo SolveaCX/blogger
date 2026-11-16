@@ -110,6 +110,21 @@ def test_blog_lifecycle_with_access_key() -> None:
     assert "<script>" not in post["html_content"]
     post_id = post["id"]
 
+    post_url = f"/api/sites/{site_id}/posts/{post_id}"
+    updated = client.patch(post_url, json={
+        "expected_updated_at": post["updated_at"],
+        "markdown_content": post["markdown_content"] + "\n\nCAS edit",
+    }, headers=key_headers)
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["updated_at"] != post["updated_at"]
+    assert "CAS edit" in updated.json()["html_content"]
+    stale = client.patch(post_url, json={
+        "expected_updated_at": post["updated_at"],
+        "markdown_content": "Stale write",
+    }, headers=key_headers)
+    assert stale.status_code == 409, stale.text
+    assert "CAS edit" in client.get(post_url, headers=key_headers).json()["markdown_content"]
+
     custom_language_post = client.post(
         f"/api/sites/{site_id}/posts",
         json={

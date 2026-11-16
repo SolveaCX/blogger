@@ -1,8 +1,8 @@
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import func, or_, select
+from sqlalchemy import String, cast, func, or_, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from app import models, schemas
@@ -680,6 +680,13 @@ def update_post(
     site = owned_site_or_404(db, user.id, site_id)
     post = owned_post_or_404(db, site_id, post_id)
     data = payload.model_dump(exclude_unset=True)
+    expected_updated_at = data.pop("expected_updated_at", None)
+    if expected_updated_at is not None:
+        current_updated_at = post.updated_at
+        current_utc = current_updated_at.replace(tzinfo=timezone.utc) if current_updated_at.tzinfo is None else current_updated_at
+        expected_utc = expected_updated_at.replace(tzinfo=timezone.utc) if expected_updated_at.tzinfo is None else expected_updated_at
+        if expected_utc != current_utc:
+            raise HTTPException(status_code=409, detail="Post version changed")
     if "category_id" in data:
         assert_category_belongs_to_site(db, site_id, data["category_id"])
     if "language" in data:
@@ -694,10 +701,34 @@ def update_post(
         )
     if "markdown_content" in data:
         data["markdown_content"] = clean_article_markdown(data["markdown_content"] or "")
-        post.html_content = render_markdown(data["markdown_content"])
-    for field, value in data.items():
-        setattr(post, field, value)
-    db.add(post)
+        data["html_content"] = render_markdown(data["markdown_content"])
+    if expected_updated_at is not None:
+        if data:
+            data["updated_at"] = max(datetime.now(timezone.utc), current_utc + timedelta(microseconds=1))
+            version_matches = models.Post.updated_at == current_updated_at
+            if db.get_bind().dialect.name == "sqlite" and current_updated_at.microsecond == 0:
+                # SQLite's CURRENT_TIMESTAMP omits fractional seconds.
+                version_matches = or_(
+                    version_matches,
+                    cast(models.Post.updated_at, String) == current_updated_at.isoformat(sep=" ", timespec="seconds"),
+                )
+            result = db.execute(
+                update(models.Post)
+                .where(models.Post.id == post_id, models.Post.site_id == site_id, version_matches)
+                .values(**data)
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                db.rollback()
+                raise HTTPException(status_code=409, detail="Post version changed")
+    else:
+        for field, value in data.items():
+            setattr(post, field, value)
+        db.add(post)
+    if expected_updated_at is not None:
+        db.refresh(post)
+        db.commit()
+        return post
     db.commit()
     return owned_post_or_404(db, site_id, post.id)
 

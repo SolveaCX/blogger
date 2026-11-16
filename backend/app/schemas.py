@@ -183,6 +183,7 @@ class PostCreate(PostBase):
 class PostUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    expected_updated_at: datetime | None = None
     title: str | None = Field(default=None, min_length=1, max_length=240)
     slug: str | None = Field(default=None, min_length=1, max_length=160, pattern=r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
     language: str | None = Field(default=None, min_length=1, max_length=64, pattern=LANGUAGE_KEY_PATTERN)
