@@ -1,8 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+import hashlib
+import hmac
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from sqlalchemy import case, select
 from sqlalchemy.orm import Session, selectinload
 
 from app import models, schemas
+from app.core.config import settings
 from app.dependencies import Principal, get_current_principal
 from app.db import get_db
 from app.post_paths import default_language_key, localized_post_path
@@ -11,7 +15,24 @@ from app.routers.sites import language_keys
 router = APIRouter(prefix="/api/integration", tags=["integration"])
 
 
-def owned_site_by_slug_or_404(db: Session, user_id: str, site_slug: str) -> models.Site:
+def require_published_integration_site(
+    site_slug: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    x_access_key: str | None = Header(default=None, alias="X-Access-Key"),
+) -> models.Site:
+    # This credential is accepted only by the published-content routes below.
+    # It never authenticates as a user or grants access to management APIs.
+    read_key_hash = settings.published_integration_key_sha256
+    read_only_access = (
+        x_access_key
+        and x_access_key.startswith("blog_ro_")
+        and site_slug == settings.published_integration_site_slug
+        and hmac.compare_digest(hashlib.sha256(x_access_key.encode()).hexdigest(), read_key_hash)
+    )
+    if not read_only_access:
+        get_current_principal(request, db, x_access_key)
+
     site = db.execute(
         select(models.Site).where(models.Site.slug == site_slug)
     ).scalar_one_or_none()
@@ -59,11 +80,9 @@ def list_integration_sites(
 
 @router.get("/sites/{site_slug}/categories", response_model=list[schemas.CategoryRead])
 def list_integration_categories(
-    site_slug: str,
-    principal: Principal = Depends(get_current_principal),
+    site: models.Site = Depends(require_published_integration_site),
     db: Session = Depends(get_db),
 ) -> list[models.Category]:
-    site = owned_site_by_slug_or_404(db, principal.user.id, site_slug)
     return list(
         db.execute(
             select(models.Category)
@@ -77,15 +96,13 @@ def list_integration_categories(
 
 @router.get("/sites/{site_slug}/posts", response_model=list[schemas.IntegrationPost])
 def list_integration_posts(
-    site_slug: str,
     category_slug: str | None = None,
     language: str | None = Query(default=None, min_length=1, max_length=64, pattern=schemas.LANGUAGE_KEY_PATTERN),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
-    principal: Principal = Depends(get_current_principal),
+    site: models.Site = Depends(require_published_integration_site),
     db: Session = Depends(get_db),
 ) -> list[schemas.IntegrationPost]:
-    site = owned_site_by_slug_or_404(db, principal.user.id, site_slug)
     assert_language_belongs_to_site(site, language)
     stmt = (
         select(models.Post)
@@ -105,13 +122,11 @@ def list_integration_posts(
 
 @router.get("/sites/{site_slug}/posts/{post_slug}", response_model=schemas.IntegrationPost)
 def get_integration_post(
-    site_slug: str,
     post_slug: str,
     language: str | None = Query(default=None, min_length=1, max_length=64, pattern=schemas.LANGUAGE_KEY_PATTERN),
-    principal: Principal = Depends(get_current_principal),
+    site: models.Site = Depends(require_published_integration_site),
     db: Session = Depends(get_db),
 ) -> schemas.IntegrationPost:
-    site = owned_site_by_slug_or_404(db, principal.user.id, site_slug)
     assert_language_belongs_to_site(site, language)
     filters = [
         models.Post.site_id == site.id,

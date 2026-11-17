@@ -1,6 +1,8 @@
 import base64
+import hashlib
 import inspect
 import os
+from dataclasses import replace
 from pathlib import Path
 
 TEST_DB = Path("/tmp/blogger-api-test.sqlite3")
@@ -15,6 +17,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.db import Base, engine  # noqa: E402
 from app.main import api_healthz, app, healthz  # noqa: E402
+from app.routers import integration  # noqa: E402
 from app.translation_service import TranslationResult  # noqa: E402
 
 Base.metadata.drop_all(bind=engine)
@@ -37,7 +40,7 @@ def reset_db() -> None:
     Base.metadata.create_all(bind=engine)
 
 
-def test_blog_lifecycle_with_access_key() -> None:
+def test_blog_lifecycle_with_access_key(monkeypatch) -> None:
     reset_db()
     register = client.post(
         "/api/auth/register",
@@ -196,6 +199,22 @@ def test_blog_lifecycle_with_access_key() -> None:
     assert slug_search_page["total"] == 2
     assert slug_search_page["items"][0]["slug"] == "first-post"
 
+    read_key = "blog_ro_test_preview_key"
+    read_headers = {"X-Access-Key": read_key}
+    integration_url = "/api/integration/sites/main-site"
+    assert client.get(f"{integration_url}/posts", headers=read_headers).status_code == 401
+    monkeypatch.setattr(integration, "settings", replace(
+        integration.settings,
+        published_integration_site_slug="main-site",
+        published_integration_key_sha256=hashlib.sha256(read_key.encode()).hexdigest(),
+    ))
+    assert client.get(f"{integration_url}/posts", headers=read_headers).json() == []
+    assert client.get(f"{integration_url}/posts/first-post", headers=read_headers).status_code == 404
+    assert client.get("/api/integration/sites", headers=read_headers).status_code == 401
+    assert client.get("/api/integration/sites/other-site/posts", headers=read_headers).status_code == 401
+    assert client.get(post_url, headers=read_headers).status_code == 401
+    assert client.post(f"{post_url}/publish", headers=read_headers).status_code == 401
+
     publish_response = client.post(f"/api/sites/{site_id}/posts/{post_id}/publish", headers=key_headers)
     assert publish_response.status_code == 200, publish_response.text
     assert publish_response.json()["status"] == "published"
@@ -222,6 +241,11 @@ def test_blog_lifecycle_with_access_key() -> None:
     assert public_custom_language_detail.json()["language"] == "zh-CN"
     assert public_custom_language_detail.json()["path"] == "/zh-CN/blog/first-post"
     assert public_custom_language_detail.json()["title"] == "Chinese Post"
+    assert client.get(f"{integration_url}/posts?language=en", headers=read_headers).json() == public_list.json()
+    assert client.get(f"{integration_url}/posts/first-post", headers=read_headers).json() == public_detail.json()
+    read_categories = client.get(f"{integration_url}/categories", headers=read_headers)
+    assert read_categories.status_code == 200
+    assert read_categories.json()[0]["slug"] == "product"
 
     upload = client.post(
         "/api/uploads",
