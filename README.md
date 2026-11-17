@@ -94,6 +94,14 @@ Product websites should use the skill in `skills/blogger-integration`. The stabl
 - `GET /api/integration/sites/{site_slug}/posts/{post_slug}?language=en-US`
 - `GET /api/integration/sites/{site_slug}/categories`
 
+For a preview that reads one site's published content, generate a random
+`blog_ro_` key (32 random bytes encoded as unpadded URL-safe base64 after the
+prefix). Set `PUBLISHED_INTEGRATION_SITE_SLUG` and
+`PUBLISHED_INTEGRATION_KEY_SHA256` (the lowercase SHA-256 of the complete key)
+on the Blogger API. Store the raw key only in the preview's server environment
+and pass it in `X-Access-Key` on the three routes above. This key has no access
+to drafts, other sites, or management endpoints.
+
 These endpoints return published content only and require an AccessKey.
 
 Post language uses the site's configured language key. Each site stores its own
