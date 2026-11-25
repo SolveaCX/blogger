@@ -117,11 +117,11 @@ export const api = {
     })
   },
   listAccessKeys: (token: string) => request<AccessKey[]>('/api/access-keys', { token }),
-  createAccessKey: (token: string, name: string) =>
+  createAccessKey: (token: string, name: string, siteId?: string) =>
     request<AccessKeyCreated>('/api/access-keys', {
       method: 'POST',
       token,
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, site_id: siteId }),
     }),
   revokeAccessKey: (token: string, id: string) =>
     request<AccessKey>(`/api/access-keys/${id}`, {

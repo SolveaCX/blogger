@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from app import models, schemas
 from app.core.config import settings
-from app.dependencies import Principal, get_current_principal
+from app.dependencies import Principal, get_authenticated_principal
 from app.db import get_db
 from app.post_paths import default_language_key, localized_post_path
 from app.routers.sites import language_keys
@@ -30,12 +30,12 @@ def require_published_integration_site(
         and site_slug == settings.published_integration_site_slug
         and hmac.compare_digest(hashlib.sha256(x_access_key.encode()).hexdigest(), read_key_hash)
     )
+    query = select(models.Site).where(models.Site.slug == site_slug)
     if not read_only_access:
-        get_current_principal(request, db, x_access_key)
-
-    site = db.execute(
-        select(models.Site).where(models.Site.slug == site_slug)
-    ).scalar_one_or_none()
+        principal = get_authenticated_principal(request, db, x_access_key)
+        if principal.access_key is not None and principal.access_key.site_id is not None:
+            query = query.where(models.Site.id == principal.access_key.site_id)
+    site = db.execute(query).scalar_one_or_none()
     if not site:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Site not found")
     return site
@@ -72,10 +72,14 @@ def assert_language_belongs_to_site(site: models.Site, language: str | None) -> 
 
 @router.get("/sites", response_model=list[schemas.SiteRead])
 def list_integration_sites(
-    principal: Principal = Depends(get_current_principal),
+    principal: Principal = Depends(get_authenticated_principal),
     db: Session = Depends(get_db),
 ) -> list[models.Site]:
-    return list(db.execute(select(models.Site).where(models.Site.owner_id == principal.user.id)).scalars().all())
+    if principal.access_key is not None and principal.access_key.site_id is not None:
+        scope = models.Site.id == principal.access_key.site_id
+    else:
+        scope = models.Site.owner_id == principal.user.id
+    return list(db.scalars(select(models.Site).where(scope)))
 
 
 @router.get("/sites/{site_slug}/categories", response_model=list[schemas.CategoryRead])

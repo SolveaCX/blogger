@@ -1,8 +1,7 @@
-import hashlib
 import logging
-import re
 from collections.abc import Callable
 from contextlib import aclosing
+from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from typing import Annotated, TypeVar
@@ -12,7 +11,7 @@ from fastapi import HTTPException
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ToolAnnotations
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, defer
@@ -22,8 +21,9 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app import models, schemas
-from app.core.config import settings
+from app.core.security import ACCESS_KEY_PREFIX
 from app.db import get_db
+from app.dependencies import authenticate_access_key
 from app.post_paths import localized_post_path
 from app.routers.posts import (
     apply_post_compare_and_swap,
@@ -39,30 +39,25 @@ Title = Annotated[str, Field(min_length=1, max_length=240)]
 Markdown = Annotated[str, Field(min_length=1, max_length=250_000)]
 Result = TypeVar("Result")
 MCP_PATH = "/api/mcp"
-TOKEN_PATTERN = re.compile(r"blog_mcp_[A-Za-z0-9_-]{43}")
 logger = logging.getLogger(__name__)
 
 
-class McpGrant(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    key_sha256: Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
-    user_id: RecordID
-    site_ids: Annotated[frozenset[RecordID], Field(min_length=1)]
+@dataclass(frozen=True)
+class McpAccess:
+    user_id: str
+    site_id: str | None
 
 
-def parse_grants(value: str) -> dict[str, McpGrant]:
-    try:
-        grants = TypeAdapter(list[McpGrant]).validate_json(value)
-    except ValidationError:
-        raise ValueError("Invalid BLOGGER_MCP_GRANTS configuration") from None
-    by_hash = {grant.key_sha256: grant for grant in grants}
-    if len(by_hash) != len(grants):
-        raise ValueError("BLOGGER_MCP_GRANTS contains duplicate key hashes")
-    return by_hash
+async def with_database(operation: Callable[[Session], Result]) -> Result:
+    async with aclosing(get_db()) as sessions:
+        db = await anext(sessions)
+        return await to_thread.run_sync(operation, db)
 
 
-mcp_grants = parse_grants(settings.mcp_grants_json)
+def authenticate_mcp_access(db: Session, token: str) -> McpAccess:
+    principal = authenticate_access_key(db, token)
+    assert principal.access_key is not None
+    return McpAccess(user_id=principal.user.id, site_id=principal.access_key.site_id)
 
 
 class McpCredentialMiddleware:
@@ -79,19 +74,30 @@ class McpCredentialMiddleware:
             return
 
         scheme, _, token = headers.get("authorization", "").partition(" ")
-        grant = None
-        if scheme.lower() == "bearer" and TOKEN_PATTERN.fullmatch(token):
-            grant = mcp_grants.get(hashlib.sha256(token.encode()).hexdigest())
-        if grant is None:
+        try:
+            if scheme.lower() != "bearer" or not token.startswith(ACCESS_KEY_PREFIX):
+                raise HTTPException(status_code=401, detail="Blogger Access Key required")
+            access = await with_database(partial(authenticate_mcp_access, token=token))
+        except HTTPException as exc:
+            if exc.status_code == 401:
+                response = JSONResponse(
+                    {"detail": "Blogger Access Key required"},
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+            else:
+                response = JSONResponse({"detail": exc.detail}, status_code=exc.status_code, headers=exc.headers)
+            await response(scope, receive, send)
+            return
+        except SQLAlchemyError as exc:
+            logger.error("Blogger MCP authentication failed (%s)", type(exc).__name__)
             response = JSONResponse(
-                {"detail": "Blogger MCP credential required"},
-                status_code=401,
-                headers={"WWW-Authenticate": "Bearer"},
+                {"detail": "Blogger database operation failed"}, status_code=503,
             )
             await response(scope, receive, send)
             return
 
-        scope.setdefault("state", {})["blogger_mcp_grant"] = grant
+        scope.setdefault("state", {})["blogger_mcp_access"] = access
         await self.app(scope, receive, send)
 
 
@@ -178,22 +184,14 @@ mcp = FastMCP(
 )
 
 
-async def run_tool(ctx: Context, operation: Callable[[Session, McpGrant], Result]) -> Result:
+async def run_tool(ctx: Context, operation: Callable[[Session, McpAccess], Result]) -> Result:
     request = ctx.request_context.request
-    grant = getattr(request.state, "blogger_mcp_grant", None) if request is not None else None
-    if not isinstance(grant, McpGrant):
-        raise ToolError("401: Blogger MCP credential required")
-
-    def invoke(db: Session) -> Result:
-        user = db.get(models.User, grant.user_id)
-        if user is None or not user.is_active:
-            raise HTTPException(status_code=401, detail="Inactive Blogger account")
-        return operation(db, grant)
+    access = getattr(request.state, "blogger_mcp_access", None) if request is not None else None
+    if not isinstance(access, McpAccess):
+        raise ToolError("401: Blogger Access Key required")
 
     try:
-        async with aclosing(get_db()) as sessions:
-            db = await anext(sessions)
-            return await to_thread.run_sync(invoke, db)
+        return await with_database(lambda db: operation(db, access))
     except HTTPException as exc:
         raise ToolError(f"{exc.status_code}: {exc.detail}") from None
     except SQLAlchemyError as exc:
@@ -201,8 +199,8 @@ async def run_tool(ctx: Context, operation: Callable[[Session, McpGrant], Result
         raise ToolError("503: Blogger database operation failed") from None
 
 
-def granted_site_or_404(db: Session, grant: McpGrant, site_id: str) -> models.Site:
-    site = db.get(models.Site, site_id) if site_id in grant.site_ids else None
+def granted_site_or_404(db: Session, access: McpAccess, site_id: str) -> models.Site:
+    site = db.get(models.Site, site_id) if access.site_id in (None, site_id) else None
     if site is None:
         raise HTTPException(status_code=404, detail="Site not found")
     return site
@@ -263,10 +261,11 @@ def detail(site: models.Site, post: models.Post) -> PostDetail:
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def list_sites(ctx: Context) -> SiteList:
     """List the Blogger sites granted to this credential, including their supported language keys."""
-    def operation(db: Session, grant: McpGrant) -> SiteList:
-        sites = db.scalars(
-            select(models.Site).where(models.Site.id.in_(grant.site_ids)).order_by(models.Site.slug)
-        )
+    def operation(db: Session, access: McpAccess) -> SiteList:
+        query = select(models.Site).order_by(models.Site.slug)
+        if access.site_id is not None:
+            query = query.where(models.Site.id == access.site_id)
+        sites = db.scalars(query)
         return SiteList(items=[SiteInfo.model_validate(site) for site in sites])
 
     return await run_tool(ctx, operation)
@@ -283,11 +282,11 @@ async def list_posts(
     offset: Annotated[int, Field(ge=0)] = 0,
 ) -> PostPage:
     """Search published posts and your own drafts by title or slug; use get_post to read the body."""
-    def operation(db: Session, grant: McpGrant) -> PostPage:
-        site = granted_site_or_404(db, grant, site_id)
+    def operation(db: Session, access: McpAccess) -> PostPage:
+        site = granted_site_or_404(db, access, site_id)
         assert_language_belongs_to_site(site, language)
         post = models.Post
-        filters = [post.site_id == site.id, visible_posts(grant.user_id)]
+        filters = [post.site_id == site.id, visible_posts(access.user_id)]
         if status is not None:
             filters.append(post.status == status)
         if language is not None:
@@ -311,9 +310,9 @@ async def list_posts(
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, openWorldHint=False))
 async def get_post(ctx: Context, site_id: RecordID, post_id: RecordID) -> PostDetail:
     """Read a published post or your draft by ID, including its article body and update timestamp."""
-    def operation(db: Session, grant: McpGrant) -> PostDetail:
-        site = granted_site_or_404(db, grant, site_id)
-        return detail(site, visible_post_or_404(db, site_id, post_id, grant.user_id))
+    def operation(db: Session, access: McpAccess) -> PostDetail:
+        site = granted_site_or_404(db, access, site_id)
+        return detail(site, visible_post_or_404(db, site_id, post_id, access.user_id))
 
     return await run_tool(ctx, operation)
 
@@ -321,11 +320,11 @@ async def get_post(ctx: Context, site_id: RecordID, post_id: RecordID) -> PostDe
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False, openWorldHint=False))
 async def create_draft(ctx: Context, site_id: RecordID, post: DraftInput) -> PostDetail:
     """Import Markdown into a new unpublished draft; an existing site, language and slug is never overwritten."""
-    def operation(db: Session, grant: McpGrant) -> PostDetail:
-        site = granted_site_or_404(db, grant, site_id)
+    def operation(db: Session, access: McpAccess) -> PostDetail:
+        site = granted_site_or_404(db, access, site_id)
         payload = schemas.PostCreate.model_validate(post.model_dump())
         try:
-            created = create_draft_post(db, site, grant.user_id, payload)
+            created = create_draft_post(db, site, access.user_id, payload)
         except IntegrityError:
             db.rollback()
             # The unique constraint also covers a concurrent create of the same slug.
@@ -346,15 +345,15 @@ async def create_draft(ctx: Context, site_id: RecordID, post: DraftInput) -> Pos
 
 def save_draft_changes(
     db: Session,
-    grant: McpGrant,
+    access: McpAccess,
     *,
     site_id: str,
     post_id: str,
     expected_updated_at: datetime,
     changes: DraftChanges,
 ) -> PostDetail:
-    site = granted_site_or_404(db, grant, site_id)
-    post = visible_post_or_404(db, site_id, post_id, grant.user_id)
+    site = granted_site_or_404(db, access, site_id)
+    post = visible_post_or_404(db, site_id, post_id, access.user_id)
     if post.status != "draft":
         raise HTTPException(status_code=403, detail="Published posts are read-only")
     if post_version_utc(post.updated_at) != expected_updated_at:
@@ -363,7 +362,7 @@ def save_draft_changes(
     data = changes.model_dump(exclude_unset=True)
     if "markdown_content" in data:
         data.update(post_markdown_fields(data["markdown_content"]))
-    apply_post_compare_and_swap(db, post, data, own_draft(grant.user_id))
+    apply_post_compare_and_swap(db, post, data, own_draft(access.user_id))
     db.refresh(post)
     db.commit()
     return detail(site, post)

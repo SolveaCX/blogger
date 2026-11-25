@@ -8,6 +8,7 @@ from app import models, schemas
 from app.core.security import create_raw_access_key
 from app.dependencies import require_user
 from app.db import get_db
+from app.routers.sites import owned_site_or_404
 
 router = APIRouter(prefix="/api/access-keys", tags=["access-keys"])
 
@@ -34,9 +35,12 @@ def create_access_key(
     user: models.User = Depends(require_user),
     db: Session = Depends(get_db),
 ) -> schemas.AccessKeyCreated:
-    raw_key, key_prefix, key_hash = create_raw_access_key()
+    if payload.site_id is not None:
+        owned_site_or_404(db, user.id, payload.site_id)
+    raw_key, key_prefix, key_hash = create_raw_access_key(site_scoped=payload.site_id is not None)
     access_key = models.AccessKey(
         user_id=user.id,
+        site_id=payload.site_id,
         name=payload.name,
         key_prefix=key_prefix,
         key_hash=key_hash,

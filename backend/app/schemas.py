@@ -79,6 +79,7 @@ class Token(BaseModel):
 
 class AccessKeyCreate(BaseModel):
     name: str = Field(min_length=1, max_length=120)
+    site_id: str | None = Field(default=None, min_length=1, max_length=36)
 
 
 class AccessKeyRead(BaseModel):
@@ -86,6 +87,7 @@ class AccessKeyRead(BaseModel):
 
     id: str
     name: str
+    site_id: str | None = None
     key_prefix: str
     last_used_at: datetime | None
     revoked_at: datetime | None

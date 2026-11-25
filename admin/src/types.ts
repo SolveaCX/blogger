@@ -20,6 +20,7 @@ export type TokenResponse = {
 export type AccessKey = {
   id: string
   name: string
+  site_id?: string | null
   key_prefix: string
   last_used_at: string | null
   revoked_at: string | null

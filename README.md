@@ -5,7 +5,7 @@ Shared blog service for product websites. The repo contains:
 - `backend`: FastAPI + SQLAlchemy API backed by Postgres.
 - `admin`: React + Tailwind + shadcn UI management UI.
 - `cli`: TypeScript npm CLI for operators and AI tools.
-- [Blogger MCP](docs/blogger-mcp.md): Streamable HTTP tools for site-scoped blog queries and draft editing.
+- [Blogger MCP](docs/blogger-mcp.md): Use a Blogger Access Key for Streamable HTTP blog queries and draft editing.
 - `skills/blogger-integration`: Codex skill for product-site integration.
 - `skills/blogger-operator`: Codex skill for AI/operator usage through the CLI.
 - `agents/api-change-sync-agent.md`: API contract sync checklist for backend/admin/CLI/skills changes.

@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, Header, HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app import models
@@ -38,7 +38,32 @@ def _bearer_token(request: Request) -> str | None:
     return token
 
 
-def get_current_principal(
+def authenticate_access_key(db: Session, raw_key: str) -> Principal:
+    access_key = db.scalar(
+        select(models.AccessKey).where(
+            models.AccessKey.revoked_at.is_(None),
+            or_(
+                and_(models.AccessKey.site_id.is_(None), models.AccessKey.key_hash == hash_access_key(raw_key)),
+                and_(
+                    models.AccessKey.site_id.is_not(None),
+                    models.AccessKey.key_hash == hash_access_key(raw_key, site_scoped=True),
+                ),
+            ),
+        )
+    )
+    if access_key is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access key")
+    user = db.get(models.User, access_key.user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Inactive user")
+    now = datetime.now(timezone.utc)
+    if should_update_access_key_usage(access_key.last_used_at, now):
+        access_key.last_used_at = now
+        db.commit()
+    return Principal(user=user, auth_type="access_key", access_key=access_key)
+
+
+def get_authenticated_principal(
     request: Request,
     db: Session = Depends(get_db),
     x_access_key: str | None = Header(default=None, alias="X-Access-Key"),
@@ -47,24 +72,7 @@ def get_current_principal(
     raw_access_key = x_access_key or (token if token and token.startswith(ACCESS_KEY_PREFIX) else None)
 
     if raw_access_key:
-        key_hash = hash_access_key(raw_access_key)
-        access_key = db.execute(
-            select(models.AccessKey).where(
-                models.AccessKey.key_hash == key_hash,
-                models.AccessKey.revoked_at.is_(None),
-            )
-        ).scalar_one_or_none()
-        if not access_key:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid access key")
-        user = db.get(models.User, access_key.user_id)
-        if not user or not user.is_active:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Inactive user")
-        now = datetime.now(timezone.utc)
-        if should_update_access_key_usage(access_key.last_used_at, now):
-            access_key.last_used_at = now
-            db.add(access_key)
-            db.commit()
-        return Principal(user=user, auth_type="access_key", access_key=access_key)
+        return authenticate_access_key(db, raw_access_key)
 
     if token:
         user_id = decode_access_token(token)
@@ -74,6 +82,12 @@ def get_current_principal(
                 return Principal(user=user, auth_type="jwt")
 
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authentication required")
+
+
+def get_current_principal(principal: Principal = Depends(get_authenticated_principal)) -> Principal:
+    if principal.access_key is not None and principal.access_key.site_id is not None:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Site-scoped access key")
+    return principal
 
 
 def require_user(principal: Principal = Depends(get_current_principal)) -> models.User:

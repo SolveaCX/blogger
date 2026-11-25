@@ -1,13 +1,14 @@
 import { zodResolver } from "@hookform/resolvers/zod"
 import { Loader2, Plus, Trash2 } from "lucide-react"
 import { useState } from "react"
-import { useForm } from "react-hook-form"
+import { useController, useForm } from "react-hook-form"
 import { useTranslation } from "react-i18next"
 import { toast } from "sonner"
 import { z } from "zod"
 import { useMutation, useQueryClient } from "@tanstack/react-query"
 
 import { Field } from "@/components/field"
+import { SimpleSelect } from "@/components/simple-select"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import {
@@ -19,12 +20,15 @@ import {
 } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { queryKeys } from "@/hooks/use-blogger-queries"
-import { api } from "@/lib/api"
+import { api, API_URL } from "@/lib/api"
 import { formatDate } from "@/lib/utils"
-import type { AccessKey, AccessKeyCreated } from "@/types"
+import type { AccessKey, AccessKeyCreated, Site } from "@/types"
+
+const accountScope = "account"
 
 const keySchema = z.object({
   name: z.string().min(1),
+  siteScope: z.string().min(1),
 })
 
 type KeyFormValues = z.infer<typeof keySchema>
@@ -32,9 +36,11 @@ type KeyFormValues = z.infer<typeof keySchema>
 export function AccessKeysView({
   token,
   accessKeys,
+  sites,
 }: {
   token: string
   accessKeys: AccessKey[]
+  sites: Site[]
 }) {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
@@ -43,11 +49,14 @@ export function AccessKeysView({
     resolver: zodResolver(keySchema),
     defaultValues: {
       name: "",
+      siteScope: accountScope,
     },
   })
+  const { field: siteScopeField } = useController({ control: form.control, name: "siteScope" })
 
   const createMutation = useMutation({
-    mutationFn: (values: KeyFormValues) => api.createAccessKey(token, values.name),
+    mutationFn: ({ name, siteScope }: KeyFormValues) =>
+      api.createAccessKey(token, name, siteScope === accountScope ? undefined : siteScope),
     onSuccess: async (key) => {
       setCreated(key)
       form.reset()
@@ -85,6 +94,7 @@ export function AccessKeysView({
       <Card>
         <CardHeader>
           <CardTitle>{t("keys.createTitle")}</CardTitle>
+          <CardDescription>{t("keys.sharedKey")}</CardDescription>
         </CardHeader>
         <CardContent>
           <form
@@ -95,6 +105,18 @@ export function AccessKeysView({
           >
             <Field label={t("keys.name")}>
               <Input {...form.register("name")} />
+            </Field>
+            <Field label={t("keys.scope")}>
+              <SimpleSelect
+                aria-label={t("keys.scope")}
+                value={siteScopeField.value}
+                onValueChange={siteScopeField.onChange}
+                options={[
+                  { value: accountScope, label: t("keys.accountScope") },
+                  ...sites.map((site) => ({ value: site.id, label: site.name })),
+                ]}
+              />
+              <p className="text-xs text-muted-foreground">{t("keys.siteScopeHelp")}</p>
             </Field>
             <Button type="submit" disabled={createMutation.isPending}>
               {createMutation.isPending ? (
@@ -119,6 +141,10 @@ export function AccessKeysView({
                 readOnly
                 onFocus={(event) => event.currentTarget.select()}
               />
+              <div className="mt-3 text-xs text-muted-foreground">
+                {t("keys.mcpUrl")}{" "}
+                <code className="break-all">{API_URL.replace(/\/$/, "")}/api/mcp</code>
+              </div>
             </div>
           ) : null}
         </CardContent>
@@ -139,6 +165,13 @@ export function AccessKeysView({
                 <CardDescription className="font-mono">
                   {key.key_prefix}...
                 </CardDescription>
+                <div className="text-xs text-muted-foreground">
+                  {key.site_id
+                    ? t("keys.siteScope", {
+                        site: sites.find((site) => site.id === key.site_id)?.name ?? key.site_id,
+                      })
+                    : t("keys.accountScope")}
+                </div>
                 <div className="text-xs text-muted-foreground">
                   {t("common.lastUsed", { date: formatDate(key.last_used_at) })}
                 </div>

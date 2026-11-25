@@ -186,7 +186,7 @@ export function AppShell() {
             />
             <Route
               path="/keys"
-              element={<AccessKeysView token={token} accessKeys={accessKeysQuery.data ?? []} />}
+              element={<AccessKeysView token={token} accessKeys={accessKeysQuery.data ?? []} sites={sites} />}
             />
             <Route
               path="/profile"

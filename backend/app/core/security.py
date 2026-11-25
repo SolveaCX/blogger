@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import secrets
 from datetime import datetime, timedelta, timezone
 
@@ -34,12 +35,19 @@ def decode_access_token(token: str) -> str | None:
     return subject if isinstance(subject, str) else None
 
 
-def hash_access_key(raw_key: str) -> str:
+def hash_access_key(raw_key: str, *, site_scoped: bool = False) -> str:
+    # Scoped keys must remain unusable by versions that do not enforce site scope.
+    if site_scoped:
+        return hmac.new(
+            settings.access_key_pepper.encode("utf-8"),
+            f"site-scoped:{raw_key}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
     value = f"{settings.access_key_pepper}:{raw_key}".encode("utf-8")
     return hashlib.sha256(value).hexdigest()
 
 
-def create_raw_access_key() -> tuple[str, str, str]:
+def create_raw_access_key(*, site_scoped: bool = False) -> tuple[str, str, str]:
     raw_key = f"{ACCESS_KEY_PREFIX}{secrets.token_urlsafe(32)}"
     key_prefix = raw_key[:18]
-    return raw_key, key_prefix, hash_access_key(raw_key)
+    return raw_key, key_prefix, hash_access_key(raw_key, site_scoped=site_scoped)

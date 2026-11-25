@@ -1,13 +1,22 @@
 # Blogger MCP 接入
 
-Blogger 后端提供 Streamable HTTP 端点 `https://<blogger-api-host>/api/mcp`，支持指定站点的文章查询、Markdown 导入草稿和本人草稿修改。实际地址以部署后的验证结果为准。
+Blogger 后端提供 Streamable HTTP 端点 `https://<blogger-api-host>/api/mcp`，支持文章查询、Markdown 导入草稿和本人草稿修改。MCP 和 REST API 使用同一把 `blog_sk_` Access Key。
+
+## 创建与撤销 Access Key
+
+在 Blogger 后台打开 **Access Keys**，填写名称并选择访问范围。
+
+- **继承账户权限**适用于现有 REST API 和 CLI 工作流，也可以连接 MCP。已有 Access Key 可以直接使用。
+- **选定站点**适用于协作。MCP 只允许查询该站已发布文章、创建和编辑本人未发布的草稿。REST API 可通过 `/api/integration/sites` 和该站的 integration 接口读取已发布内容。
+
+创建后复制完整密钥并保存在密码管理器中。在同一页面撤销密钥后，MCP 和 REST 请求都会失效。持有旧版专用 MCP 凭证的用户需要在 Access Keys 页面签发统一密钥。
 
 ## Claude Code 接入
 
-在 Claude Code 使用的终端设置 `BLOGGER_MCP_URL` 为已开通的地址，并通过密码管理器或安全的环境变量管理方式注入 `BLOGGER_MCP_TOKEN`。在工作目录执行下面的命令。单引号让环境变量引用原样写入配置，实际值在客户端读取配置时展开。
+在 Claude Code 使用的终端设置 `BLOGGER_MCP_URL` 为部署后的地址，通过密码管理器或安全的环境变量管理方式将 Access Key 注入 `BLOGGER_ACCESS_KEY`。在工作目录执行下面的命令。单引号让环境变量引用原样写入配置，实际值在客户端读取配置时展开。
 
 ```bash
-claude mcp add-json --scope local blogger-blog '{"type":"http","url":"${BLOGGER_MCP_URL}","headers":{"Authorization":"Bearer ${BLOGGER_MCP_TOKEN}"}}'
+claude mcp add-json --scope local blogger-blog '{"type":"http","url":"${BLOGGER_MCP_URL}","headers":{"Authorization":"Bearer ${BLOGGER_ACCESS_KEY}"}}'
 claude mcp list
 ```
 
@@ -42,24 +51,10 @@ claude mcp list
 
 修改时先调用 `get_post`，再把最新的 `updated_at`（包含时区）传给 `expected_updated_at`。收到 `409` 时重新查询并检查其他修改后再提交。旧文修订可以用 `get_post` 读取原文，再用独立 slug 建一份草稿。把原文 URL 和草稿 ID 一并交给站点负责人，由他们审核并应用到原文。视频可先用 Markdown 链接，播放器嵌入取决于站点支持。
 
-## 内部开通与验证
+## 部署验证
 
-1. 确认目标站点已经接入该 Blogger 实例，并核实站点 ID。VOC.ai 需单独确认。给每位协作者配置独立的 Blogger 作者身份和凭证，负责人保留账号登录与普通管理密钥。
-2. 为每位协作者生成 `blog_mcp_` 加 `secrets.token_urlsafe(32)` 的随机凭证。用密码管理器保存原值，以加密渠道交付。服务端只保存整个凭证的 SHA-256 小写十六进制摘要。
-3. 在 Blogger API 的部署配置中设置 `BLOGGER_MCP_GRANTS`，按下例填入真实的数据库 ID 和摘要。空列表 `[]` 时，MCP 请求没有可用凭证。轮换或撤销时更新配置并部署到所有实例。
+使用现有 schema 初始化流程为 `access_keys` 增加可选的 `site_id`。关闭自动建表的环境需先应用该字段迁移。确认 HTTPS 网关转发 `/api/mcp` 和 `Authorization` 请求头。
 
-```json
-[
-  {
-    "key_sha256": "<64 lowercase hexadecimal characters>",
-    "user_id": "<active dedicated Blogger user ID>",
-    "site_ids": ["<approved Blogger site ID>"]
-  }
-]
-```
-
-在部署链上保留该配置。Cloud Run 脚本的 `--set-env-vars` 与 `--set-secrets` 会重设对应配置，若走该脚本应在正式部署配置里显式注入。核对 HTTPS 入口将 `/api/mcp` 路径及 `Authorization` 请求头转到 API。现有普通 REST 注册接口会为新用户签发可跨站操作的 `operator` 账号，对外开通前须确认生产入口对自助注册有适当限制。
-
-用测试凭证验证 `list_sites` 只返回授权站点，跨站请求被拒，已上线文章和其他作者的草稿无法修改，凭证也无法登录普通 REST 管理接口。再用明确标记的测试草稿验证创建、更新和重复提交冲突。MCP 的修改工具只接受已授权站点内、归该作者的当前草稿。发布和应用旧文修订通过原有 CMS 审核流程执行。
+用测试 Access Key 验证站点范围、本人草稿编辑和版本冲突。撤销测试 Key 后，重新验证 MCP 和 REST 均拒绝它。发布及旧文修订继续走 Blogger 后台的审核流程。
 
 参考 [Claude Code MCP 配置](https://code.claude.com/docs/en/mcp)。

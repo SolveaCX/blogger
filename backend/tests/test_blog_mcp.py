@@ -1,6 +1,4 @@
 import asyncio
-import hashlib
-import json
 from dataclasses import replace
 from datetime import datetime, timezone
 
@@ -9,7 +7,8 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from sqlalchemy.orm import sessionmaker
 
-from app import blog_mcp, db, main, models
+from app import db, main, models
+from app.core.security import create_access_token, create_raw_access_key, hash_access_key
 
 
 def test_blog_mcp_scoped_draft_workflow(tmp_path, monkeypatch):
@@ -19,18 +18,13 @@ def test_blog_mcp_scoped_draft_workflow(tmp_path, monkeypatch):
     monkeypatch.setattr(db, "SessionLocal", sessions)
     monkeypatch.setattr(main, "settings", replace(main.settings, auto_create_tables=False))
 
-    token = "blog_mcp_" + "a" * 43
-    grants = [{
-        "key_sha256": hashlib.sha256(token.encode()).hexdigest(),
-        "user_id": "writer",
-        "site_ids": ["first"],
-    }]
-    monkeypatch.setattr(blog_mcp, "mcp_grants", blog_mcp.parse_grants(json.dumps(grants)))
+    legacy_token, legacy_prefix, legacy_hash = create_raw_access_key()
     with sessions.begin() as session:
         for user_id in ("editor", "writer"):
             session.add(models.User(id=user_id, email=f"{user_id}@example.com", hashed_password="test-only"))
         for site_id in ("first", "second"):
             session.add(models.Site(id=site_id, slug=site_id, name=site_id, owner_id="editor"))
+        session.add(models.AccessKey(user_id="writer", name="existing", key_prefix=legacy_prefix, key_hash=legacy_hash))
         for post_id, site_id, status in (
             ("live", "first", "published"),
             ("private", "first", "draft"),
@@ -93,13 +87,54 @@ def test_blog_mcp_scoped_draft_workflow(tmp_path, monkeypatch):
     async def run():
         async with main.app.router.lifespan_context(main.app):
             async with AsyncClient(transport=ASGITransport(app=main.app), base_url="http://testserver") as http:
-                assert (await http.post("/api/mcp")).status_code == 401
+                missing = await http.post("/api/mcp")
+                assert missing.status_code == 401 and missing.headers["WWW-Authenticate"] == "Bearer"
+                login = {"Authorization": f"Bearer {create_access_token('writer')}"}
+                assert (await http.post("/api/mcp", headers=login)).status_code == 401
+                assert (await http.post("/api/access-keys", json={"name": "bad site", "site_id": "missing"}, headers=login)).status_code == 404
+                response = await http.post(
+                    "/api/access-keys", json={"name": "writer key", "site_id": "first"}, headers=login,
+                )
+                assert response.status_code == 201, response.text
+                key = response.json()
+                token = key["access_key"]
+                assert token.startswith("blog_sk_") and key["site_id"] == "first"
+                with sessions() as session:
+                    assert session.get(models.AccessKey, key["id"]).key_hash not in {
+                        hash_access_key(token), hash_access_key(f"site-scoped:{token}"),
+                    }
                 http.headers["Authorization"] = f"Bearer {token}"
                 assert (await http.post("/api/mcp", headers={"Origin": "https://example.com"})).status_code == 403
-                assert (await http.get("/api/sites")).status_code == 401
                 async with streamable_http_client("http://testserver/api/mcp", http_client=http) as (read, write, _):
                     async with ClientSession(read, write) as client:
-                        return await exercise_tools(client)
+                        draft_id = await exercise_tools(client)
+                with sessions() as session:
+                    assert session.get(models.AccessKey, key["id"]).last_used_at is not None
+
+                sites = await http.get("/api/integration/sites")
+                assert [site["id"] for site in sites.json()] == ["first"]
+                assert (await http.get("/api/integration/sites/first/posts/live")).status_code == 200
+                assert (await http.get("/api/integration/sites/second/posts/other")).status_code == 404
+                assert (await http.get("/api/sites")).status_code == 403
+                assert (await http.post("/api/access-keys", json={"name": "escape"})).status_code == 403
+                assert (await http.post(f"/api/sites/first/posts/{draft_id}/publish")).status_code == 403
+
+                assert (await http.delete(f"/api/access-keys/{key['id']}", headers=login)).status_code == 200
+                assert (await http.post("/api/mcp")).status_code == 401
+                assert (await http.get("/api/integration/sites/first/posts/live")).status_code == 401
+
+                http.headers["Authorization"] = f"Bearer {legacy_token}"
+                assert (await http.get("/api/sites")).status_code == 200
+                async with streamable_http_client("http://testserver/api/mcp", http_client=http) as (read, write, _):
+                    async with ClientSession(read, write) as client:
+                        await client.initialize()
+                        sites = (await client.call_tool("list_sites", {})).structuredContent
+                        assert [site["id"] for site in sites["items"]] == ["first", "second"]
+                with sessions.begin() as session:
+                    session.get(models.User, "writer").is_active = False
+                assert (await http.post("/api/mcp")).status_code == 401
+                assert (await http.get("/api/sites")).status_code == 401
+                return draft_id
 
     try:
         draft_id = asyncio.run(run())

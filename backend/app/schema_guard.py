@@ -45,6 +45,11 @@ def ensure_schema() -> None:
     if users and "role" not in users:
         _add_column("users", "role VARCHAR(24) NOT NULL DEFAULT 'operator'")
 
+    access_keys = _column_names("access_keys")
+    if access_keys and "site_id" not in access_keys:
+        if_not_exists = "IF NOT EXISTS " if engine.dialect.name == "postgresql" else ""
+        _add_column("access_keys", f"{if_not_exists}site_id VARCHAR(36) REFERENCES sites(id) ON DELETE CASCADE")
+
     sites = _column_names("sites")
     if sites and "icon_url" not in sites:
         _add_column("sites", "icon_url VARCHAR(1000)")
