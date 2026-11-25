@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import String, cast, func, or_, select, update
 from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.sql.elements import ColumnElement
 
 from app import models, schemas
 from app.dependencies import require_super_admin, require_super_admin_access_key, require_user
@@ -78,6 +79,55 @@ def assert_language_belongs_to_site(site: models.Site, language: str | None) -> 
         return
     if language not in language_keys(site):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid language for site")
+
+
+def post_markdown_fields(markdown_content: str) -> dict[str, str]:
+    markdown_content = clean_article_markdown(markdown_content)
+    return {"markdown_content": markdown_content, "html_content": render_markdown(markdown_content)}
+
+
+def create_draft_post(
+    db: Session,
+    site: models.Site,
+    author_id: str,
+    payload: schemas.PostCreate,
+) -> models.Post:
+    assert_language_belongs_to_site(site, payload.language)
+    assert_post_slug_available(db, site.id, payload.language, payload.slug)
+    assert_category_belongs_to_site(db, site.id, payload.category_id)
+    data = payload.model_dump()
+    data.update(post_markdown_fields(payload.markdown_content))
+    post = models.Post(site_id=site.id, author_id=author_id, status="draft", **data)
+    db.add(post)
+    db.commit()
+    return owned_post_or_404(db, site.id, post.id)
+
+
+def post_version_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+def apply_post_compare_and_swap(
+    db: Session, post: models.Post, data: dict, *guards: ColumnElement[bool],
+) -> None:
+    current = post.updated_at
+    next_version = max(datetime.now(timezone.utc), post_version_utc(current) + timedelta(microseconds=1))
+    version_matches = models.Post.updated_at == current
+    if db.get_bind().dialect.name == "sqlite" and current.microsecond == 0:
+        # SQLite's CURRENT_TIMESTAMP omits fractional seconds.
+        version_matches = or_(
+            version_matches,
+            cast(models.Post.updated_at, String) == current.isoformat(sep=" ", timespec="seconds"),
+        )
+    result = db.execute(
+        update(models.Post)
+        .where(models.Post.id == post.id, models.Post.site_id == post.site_id, version_matches, *guards)
+        .values(**data, updated_at=next_version)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Post version changed")
 
 
 def site_language_label(site: models.Site, language: str) -> str:
@@ -406,21 +456,7 @@ def create_post(
     db: Session = Depends(get_db),
 ) -> models.Post:
     site = owned_site_or_404(db, user.id, site_id)
-    assert_language_belongs_to_site(site, payload.language)
-    assert_post_slug_available(db, site_id, payload.language, payload.slug)
-    assert_category_belongs_to_site(db, site_id, payload.category_id)
-    data = payload.model_dump()
-    data["markdown_content"] = clean_article_markdown(payload.markdown_content)
-    post = models.Post(
-        site_id=site_id,
-        author_id=user.id,
-        status="draft",
-        html_content=render_markdown(data["markdown_content"]),
-        **data,
-    )
-    db.add(post)
-    db.commit()
-    return owned_post_or_404(db, site_id, post.id)
+    return create_draft_post(db, site, user.id, payload)
 
 
 @router.post("/import", response_model=schemas.PostRead)
@@ -681,12 +717,8 @@ def update_post(
     post = owned_post_or_404(db, site_id, post_id)
     data = payload.model_dump(exclude_unset=True)
     expected_updated_at = data.pop("expected_updated_at", None)
-    if expected_updated_at is not None:
-        current_updated_at = post.updated_at
-        current_utc = current_updated_at.replace(tzinfo=timezone.utc) if current_updated_at.tzinfo is None else current_updated_at
-        expected_utc = expected_updated_at.replace(tzinfo=timezone.utc) if expected_updated_at.tzinfo is None else expected_updated_at
-        if expected_utc != current_utc:
-            raise HTTPException(status_code=409, detail="Post version changed")
+    if expected_updated_at is not None and post_version_utc(expected_updated_at) != post_version_utc(post.updated_at):
+        raise HTTPException(status_code=409, detail="Post version changed")
     if "category_id" in data:
         assert_category_belongs_to_site(db, site_id, data["category_id"])
     if "language" in data:
@@ -700,27 +732,10 @@ def update_post(
             current_id=post.id,
         )
     if "markdown_content" in data:
-        data["markdown_content"] = clean_article_markdown(data["markdown_content"] or "")
-        data["html_content"] = render_markdown(data["markdown_content"])
+        data.update(post_markdown_fields(data["markdown_content"] or ""))
     if expected_updated_at is not None:
         if data:
-            data["updated_at"] = max(datetime.now(timezone.utc), current_utc + timedelta(microseconds=1))
-            version_matches = models.Post.updated_at == current_updated_at
-            if db.get_bind().dialect.name == "sqlite" and current_updated_at.microsecond == 0:
-                # SQLite's CURRENT_TIMESTAMP omits fractional seconds.
-                version_matches = or_(
-                    version_matches,
-                    cast(models.Post.updated_at, String) == current_updated_at.isoformat(sep=" ", timespec="seconds"),
-                )
-            result = db.execute(
-                update(models.Post)
-                .where(models.Post.id == post_id, models.Post.site_id == site_id, version_matches)
-                .values(**data)
-                .execution_options(synchronize_session=False)
-            )
-            if result.rowcount != 1:
-                db.rollback()
-                raise HTTPException(status_code=409, detail="Post version changed")
+            apply_post_compare_and_swap(db, post, data)
     else:
         for field, value in data.items():
             setattr(post, field, value)

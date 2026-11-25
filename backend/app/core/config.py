@@ -20,6 +20,7 @@ class Settings:
     access_key_pepper: str = os.getenv("ACCESS_KEY_PEPPER", "dev-only-access-key-pepper")
     published_integration_site_slug: str = os.getenv("PUBLISHED_INTEGRATION_SITE_SLUG", "").strip()
     published_integration_key_sha256: str = os.getenv("PUBLISHED_INTEGRATION_KEY_SHA256", "").strip()
+    mcp_grants_json: str = os.getenv("BLOGGER_MCP_GRANTS", "").strip() or "[]"
     jwt_algorithm: str = "HS256"
     access_token_minutes: int = int(os.getenv("ACCESS_TOKEN_MINUTES", "10080"))
     allowed_origins: list[str] = None  # type: ignore[assignment]
