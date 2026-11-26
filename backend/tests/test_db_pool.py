@@ -78,6 +78,9 @@ def test_database_request_slots_are_released_after_session_cleanup(monkeypatch):
     class FakeSession:
         closed = False
 
+        def __init__(self):
+            self.info = {}
+
         def close(self):
             self.closed = True
 
@@ -127,6 +130,7 @@ def test_sync_routes_cannot_starve_database_session_cleanup(monkeypatch):
 
     class FakeSession:
         def __init__(self):
+            self.info = {}
             with lock:
                 state["open"] += 1
                 state["maximum"] = max(state["maximum"], state["open"])
