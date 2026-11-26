@@ -5,10 +5,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import String, cast, func, or_, select, update
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy.sql.elements import ColumnElement
+from starlette.concurrency import run_in_threadpool
 
 from app import models, schemas
 from app.dependencies import require_super_admin, require_super_admin_access_key, require_user
-from app.db import get_db
+from app.db import get_db, run_translation_without_database
 from app.markdown_render import clean_article_markdown, render_markdown, sanitize_html_fragment
 from app.post_paths import localized_post_canonical_url
 from app.routers.sites import language_keys, owned_site_or_404
@@ -288,11 +289,6 @@ def _plan_translation_work(
     return work_items
 
 
-def _end_transaction(db: Session) -> None:
-    if db.in_transaction():
-        db.rollback()
-
-
 def _translate_work_items(
     source_article: schemas.TranslationTemplateArticleInput,
     work_items: list[TranslationWorkItem],
@@ -519,132 +515,134 @@ def get_post(
     "/translations/generate-and-publish",
     response_model=schemas.TranslationGeneratePublishResponse,
 )
-def generate_and_publish_translations_from_article(
+async def generate_and_publish_translations_from_article(
     site_id: str,
     payload: schemas.TranslationGenerateFromArticleRequest,
     user: models.User = Depends(require_super_admin_access_key),
     db: Session = Depends(get_db),
 ) -> schemas.TranslationGeneratePublishResponse:
-    site = owned_site_or_404(db, user.id, site_id)
     article = payload.article
 
-    assert_language_belongs_to_site(site, article.language)
-    assert_category_belongs_to_site(db, site_id, article.category_id)
-    for language in payload.languages:
-        assert_language_belongs_to_site(site, language)
-
-    requested_languages = payload.languages or [language for language in ordered_language_keys(site) if language != article.language]
-    target_languages = [language for language in requested_languages if language != article.language]
-    translation_options = TranslationOptions(languages=target_languages, overwrite_existing=payload.overwrite_existing)
-
-    try:
-        work_items = _plan_translation_work(
-            db,
-            site,
-            article,
-            source_post_id=None,
-            source_status="draft",
-            options=translation_options,
-            allow_overwrite_published=True,
-        )
-        _end_transaction(db)
-        translated_by_language = _translate_work_items(article, work_items)
-
-        site = owned_site_or_404(db, user.id, site_id)
+    def prepare() -> tuple[str, TranslationOptions, list[TranslationWorkItem]]:
+        user_id = user.id
+        site = owned_site_or_404(db, user_id, site_id)
+        assert_language_belongs_to_site(site, article.language)
         assert_category_belongs_to_site(db, site_id, article.category_id)
-        for language in target_languages:
+        for language in payload.languages:
+            assert_language_belongs_to_site(site, language)
+        languages = payload.languages or ordered_language_keys(site)
+        options = TranslationOptions(
+            languages=[language for language in languages if language != article.language],
+            overwrite_existing=payload.overwrite_existing,
+        )
+        work = _plan_translation_work(
+            db, site, article, source_post_id=None, source_status="draft",
+            options=options, allow_overwrite_published=True,
+        )
+        return user_id, options, work
+
+    user_id, options, work = await run_in_threadpool(prepare)
+    translated = await _generate_outside_database(db, article, work)
+
+    def save() -> schemas.TranslationGeneratePublishResponse:
+        site = owned_site_or_404(db, user_id, site_id)
+        assert_category_belongs_to_site(db, site_id, article.category_id)
+        for language in options.languages:
             assert_language_belongs_to_site(site, language)
 
-        source_post, source_action = upsert_template_article_post(db, site, article, author_id=user.id)
+        source_post, source_action = upsert_template_article_post(db, site, article, author_id=user_id)
         translation_results, changed_posts = _apply_generated_translations(
-            db,
-            site,
-            article,
-            author_id=source_post.author_id,
-            options=translation_options,
-            allow_overwrite_published=True,
-            work_items=work_items,
-            translated_by_language=translated_by_language,
+            db, site, article, author_id=source_post.author_id, options=options,
+            allow_overwrite_published=True, work_items=work, translated_by_language=translated,
         )
+        source_result = schemas.TranslationGeneratePublishResult(
+            language=article.language, action=source_action, post_id=source_post.id, status=source_post.status,
+        )
+        all_results = [source_result, *translation_results]
+        publish_posts([source_post, *changed_posts], all_results)
+        db.commit()
+        return schemas.TranslationGeneratePublishResponse(
+            source_post_id=source_post.id, source_language=article.language, results=all_results,
+        )
+
+    return await run_in_threadpool(save)
+
+
+async def _generate_outside_database(
+    db: Session,
+    article: schemas.TranslationTemplateArticleInput,
+    work: list[TranslationWorkItem],
+) -> dict[str, GeneratedTranslationResult]:
+    try:
+        return await run_translation_without_database(db, _translate_work_items, article, work)
     except TranslationUnavailableError as exc:
-        db.rollback()
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
 
-    source_result = schemas.TranslationGeneratePublishResult(
-        language=article.language,
-        action=source_action,
-        post_id=source_post.id,
-        status=source_post.status,
-    )
-    all_results = [source_result, *translation_results]
-    publish_posts([source_post, *changed_posts], all_results)
-    db.commit()
-    return schemas.TranslationGeneratePublishResponse(
-        source_post_id=source_post.id,
-        source_language=article.language,
-        results=all_results,
-    )
+
+async def _generate_post_translations(
+    site_id: str,
+    post_id: str,
+    payload: schemas.TranslationGenerateRequest,
+    user: models.User,
+    db: Session,
+    *,
+    publish: bool,
+) -> schemas.TranslationGeneratePublishResponse:
+    options = TranslationOptions(languages=payload.languages, overwrite_existing=payload.overwrite_existing)
+
+    def prepare() -> tuple[str, schemas.TranslationTemplateArticleInput, list[TranslationWorkItem]]:
+        user_id = user.id
+        site = owned_site_or_404(db, user_id, site_id)
+        source_post = owned_post_or_404(db, site_id, post_id)
+        article = template_article_from_post(source_post)
+        for language in options.languages:
+            assert_language_belongs_to_site(site, language)
+        work = _plan_translation_work(
+            db, site, article, source_post_id=source_post.id, source_status=source_post.status,
+            options=options, allow_overwrite_published=False,
+        )
+        return user_id, article, work
+
+    user_id, article, work = await run_in_threadpool(prepare)
+    translated = await _generate_outside_database(db, article, work)
+
+    def save() -> schemas.TranslationGeneratePublishResponse:
+        site = owned_site_or_404(db, user_id, site_id)
+        source_post = owned_post_or_404(db, site_id, post_id)
+        results, changed_posts = _apply_generated_translations(
+            db, site, article, author_id=source_post.author_id, options=options,
+            allow_overwrite_published=False, work_items=work, translated_by_language=translated,
+        )
+        if publish:
+            publish_posts(changed_posts, results)
+        db.commit()
+        return schemas.TranslationGeneratePublishResponse(
+            source_post_id=source_post.id, source_language=source_post.language, results=results,
+        )
+
+    return await run_in_threadpool(save)
 
 
 @router.post(
     "/{post_id}/translations/generate",
     response_model=schemas.TranslationGenerateResponse,
 )
-def generate_translations(
+async def generate_translations(
     site_id: str,
     post_id: str,
     payload: schemas.TranslationGenerateRequest,
     user: models.User = Depends(require_super_admin),
     db: Session = Depends(get_db),
 ) -> schemas.TranslationGenerateResponse:
-    site = owned_site_or_404(db, user.id, site_id)
-    source_post = owned_post_or_404(db, site_id, post_id)
-    source_article = template_article_from_post(source_post)
-
-    for language in payload.languages:
-        assert_language_belongs_to_site(site, language)
-
-    try:
-        work_items = _plan_translation_work(
-            db,
-            site,
-            source_article,
-            source_post_id=source_post.id,
-            source_status=source_post.status,
-            options=TranslationOptions(languages=payload.languages, overwrite_existing=payload.overwrite_existing),
-            allow_overwrite_published=False,
-        )
-        _end_transaction(db)
-        translated_by_language = _translate_work_items(source_article, work_items)
-
-        site = owned_site_or_404(db, user.id, site_id)
-        source_post = owned_post_or_404(db, site_id, post_id)
-        results, _ = _apply_generated_translations(
-            db,
-            site,
-            source_article,
-            author_id=source_post.author_id,
-            options=TranslationOptions(languages=payload.languages, overwrite_existing=payload.overwrite_existing),
-            allow_overwrite_published=False,
-            work_items=work_items,
-            translated_by_language=translated_by_language,
-        )
-    except TranslationUnavailableError as exc:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
-
-    db.commit()
+    response = await _generate_post_translations(site_id, post_id, payload, user, db, publish=False)
     return schemas.TranslationGenerateResponse(
-        source_post_id=source_post.id,
-        source_language=source_post.language,
+        source_post_id=response.source_post_id,
+        source_language=response.source_language,
         results=[
             schemas.TranslationGenerateResult(
-                language=result.language,
-                action=result.action,
-                reason=result.reason,
-                post_id=result.post_id,
+                language=result.language, action=result.action, reason=result.reason, post_id=result.post_id,
             )
-            for result in results
+            for result in response.results
         ],
     )
 
@@ -653,56 +651,14 @@ def generate_translations(
     "/{post_id}/translations/generate-and-publish",
     response_model=schemas.TranslationGeneratePublishResponse,
 )
-def generate_and_publish_translations(
+async def generate_and_publish_translations(
     site_id: str,
     post_id: str,
     payload: schemas.TranslationGenerateRequest,
     user: models.User = Depends(require_super_admin_access_key),
     db: Session = Depends(get_db),
 ) -> schemas.TranslationGeneratePublishResponse:
-    site = owned_site_or_404(db, user.id, site_id)
-    source_post = owned_post_or_404(db, site_id, post_id)
-    source_article = template_article_from_post(source_post)
-
-    for language in payload.languages:
-        assert_language_belongs_to_site(site, language)
-
-    try:
-        work_items = _plan_translation_work(
-            db,
-            site,
-            source_article,
-            source_post_id=source_post.id,
-            source_status=source_post.status,
-            options=TranslationOptions(languages=payload.languages, overwrite_existing=payload.overwrite_existing),
-            allow_overwrite_published=False,
-        )
-        _end_transaction(db)
-        translated_by_language = _translate_work_items(source_article, work_items)
-
-        site = owned_site_or_404(db, user.id, site_id)
-        source_post = owned_post_or_404(db, site_id, post_id)
-        results, changed_posts = _apply_generated_translations(
-            db,
-            site,
-            source_article,
-            author_id=source_post.author_id,
-            options=TranslationOptions(languages=payload.languages, overwrite_existing=payload.overwrite_existing),
-            allow_overwrite_published=False,
-            work_items=work_items,
-            translated_by_language=translated_by_language,
-        )
-    except TranslationUnavailableError as exc:
-        db.rollback()
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
-
-    publish_posts(changed_posts, results)
-    db.commit()
-    return schemas.TranslationGeneratePublishResponse(
-        source_post_id=source_post.id,
-        source_language=source_post.language,
-        results=results,
-    )
+    return await _generate_post_translations(site_id, post_id, payload, user, db, publish=True)
 
 
 @router.patch("/{post_id}", response_model=schemas.PostRead)

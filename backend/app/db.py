@@ -1,8 +1,9 @@
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 import os
+from typing import TypeVar
 
-from anyio import CancelScope, to_thread
+from anyio import CancelScope, CapacityLimiter, to_thread
 from fastapi import HTTPException, status
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
@@ -88,13 +89,19 @@ def database_request_capacity(database_url: str) -> int:
     return capacity
 
 
-_database_request_slots = asyncio.Semaphore(database_request_capacity(settings.database_url))
+_database_capacity = database_request_capacity(settings.database_url)
+_database_request_slots = asyncio.Semaphore(_database_capacity)
+# Keep the previous upstream concurrency bound without using the shared sync
+# worker budget or retaining a database permit while the provider responds.
+_translation_workers = CapacityLimiter(_database_capacity)
+_suspended_database_slot = "blogger_suspended_database_slot"
+_T = TypeVar("_T")
 _database_request_queue_timeout_seconds = float(os.getenv("DB_REQUEST_QUEUE_TIMEOUT_SECONDS", "5"))
 if _database_request_queue_timeout_seconds <= 0:
     raise ValueError("DB_REQUEST_QUEUE_TIMEOUT_SECONDS must be positive")
 
 
-async def get_db() -> AsyncGenerator[Session, None]:
+async def _acquire_database_slot() -> None:
     try:
         await asyncio.wait_for(
             _database_request_slots.acquire(),
@@ -107,6 +114,23 @@ async def get_db() -> AsyncGenerator[Session, None]:
             headers={"Retry-After": "1"},
         ) from exc
 
+
+async def run_translation_without_database(
+    db: Session, translate: Callable[..., _T], *args: object
+) -> _T:
+    # Rollback returns the connection and expires ORM objects. The translation
+    # phase takes only detached input, and the caller re-reads state on return.
+    await to_thread.run_sync(db.rollback)
+    db.info[_suspended_database_slot] = True
+    _database_request_slots.release()
+    result = await to_thread.run_sync(translate, *args, limiter=_translation_workers)
+    await _acquire_database_slot()
+    db.info.pop(_suspended_database_slot)
+    return result
+
+
+async def get_db() -> AsyncGenerator[Session, None]:
+    await _acquire_database_slot()
     db: Session | None = None
     try:
         db = SessionLocal()
@@ -119,4 +143,5 @@ async def get_db() -> AsyncGenerator[Session, None]:
                 with CancelScope(shield=True):
                     await to_thread.run_sync(db.close)
         finally:
-            _database_request_slots.release()
+            if db is None or not db.info.get(_suspended_database_slot):
+                _database_request_slots.release()

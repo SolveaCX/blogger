@@ -1,9 +1,14 @@
+import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import inspect
 import os
 from dataclasses import replace
 from pathlib import Path
+import threading
+
+import pytest
 
 TEST_DB = Path("/tmp/blogger-api-test.sqlite3")
 if TEST_DB.exists():
@@ -13,12 +18,15 @@ os.environ["DATABASE_URL"] = f"sqlite+pysqlite:///{TEST_DB}"
 os.environ["SECRET_KEY"] = "test-secret"
 os.environ["ACCESS_KEY_PEPPER"] = "test-pepper"
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient  # noqa: E402
 
+from app import db as db_module  # noqa: E402
 from app.db import Base, engine  # noqa: E402
 from app.main import api_healthz, app, healthz  # noqa: E402
+from app.routers import access_keys, auth, integration, posts, sites  # noqa: E402
 from app.routers import integration  # noqa: E402
-from app.translation_service import TranslationResult  # noqa: E402
+from app.translation_service import TranslationResult, TranslationUnavailableError  # noqa: E402
 
 Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
@@ -402,6 +410,76 @@ def test_import_post_upsert_preserves_source_fields() -> None:
     assert updated["title"] == "Imported Post Updated"
     assert updated["status"] == "draft"
     assert updated["published_at"] is None
+
+
+@pytest.mark.parametrize("provider_fails", [False, True])
+def test_translation_does_not_hold_database_admission(monkeypatch, provider_fails: bool) -> None:
+    reset_db()
+    monkeypatch.setattr(db_module, "_database_request_slots", asyncio.Semaphore(1))
+    monkeypatch.setattr(db_module, "_database_request_queue_timeout_seconds", 0.5)
+    provider_entered = threading.Event()
+    finish_provider = threading.Event()
+
+    def fake_translate(source):
+        provider_entered.set()
+        assert finish_provider.wait(timeout=5)
+        if provider_fails:
+            raise TranslationUnavailableError("provider failed")
+        return TranslationResult(title="Article traduit", html_content="<p>Texte traduit.</p>")
+
+    monkeypatch.setattr("app.routers.posts.translate_post", fake_translate)
+    api_app = FastAPI()
+    for router in (auth.router, access_keys.router, sites.router, posts.router, integration.router):
+        api_app.include_router(router)
+    with TestClient(api_app) as api:
+        owner = api.post(
+            "/api/auth/register",
+            json={"email": "capacity@example.com", "password": "password123", "nickname": "Owner"},
+        )
+        assert owner.status_code == 201, owner.text
+        jwt_headers = {"Authorization": f"Bearer {owner.json()['access_token']}"}
+        key = api.post("/api/access-keys", json={"name": "capacity test"}, headers=jwt_headers)
+        assert key.status_code == 201, key.text
+        headers = {"X-Access-Key": key.json()["access_key"]}
+        site = api.post(
+            "/api/sites", json={"name": "Capacity", "slug": "capacity", "base_url": "https://example.com"},
+            headers=headers,
+        )
+        assert site.status_code == 201, site.text
+        site_path = f"/api/sites/{site.json()['id']}"
+        langs = api.patch(
+            site_path, json={"languages": [{"key": "en", "label": "English"}, {"key": "fr", "label": "French"}]},
+            headers=headers,
+        )
+        assert langs.status_code == 200, langs.text
+        created = api.post(
+            f"{site_path}/posts",
+            json={"title": "Source", "slug": "source", "language": "en", "markdown_content": "Source text."},
+            headers=headers,
+        )
+        assert created.status_code == 201, created.text
+        post_path = f"{site_path}/posts/{created.json()['id']}"
+        published = api.post(f"{post_path}/publish", headers=headers)
+        assert published.status_code == 200, published.text
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            translation = pool.submit(
+                api.post, f"{post_path}/translations/generate-and-publish", headers=headers,
+                json={"languages": ["fr"], "overwrite_existing": False},
+            )
+            try:
+                assert provider_entered.wait(timeout=5)
+                read = api.get("/api/integration/sites/capacity/posts/source?language=en", headers=headers)
+                assert read.status_code == 200, read.text
+                assert read.json()["title"] == "Source"
+                assert not translation.done()
+            finally:
+                finish_provider.set()
+            result = translation.result(timeout=5)
+        assert result.status_code == (503 if provider_fails else 200), result.text
+        if not provider_fails:
+            assert result.json()["results"][0]["status"] == "published"
+        assert api.get(post_path, headers=headers).status_code == 200
 
 
 def test_generate_translation_drafts(monkeypatch) -> None:
